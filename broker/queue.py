@@ -3,7 +3,7 @@ from collections import defaultdict, OrderedDict
 from datetime import datetime
 from typing import Dict, Set
 
-from broker import exceptions
+from common import exceptions
 
 
 class Queue:

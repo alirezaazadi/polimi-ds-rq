@@ -3,7 +3,8 @@ import logging
 import asyncio
 from typing import Set
 
-from common import address as addr, config as cfg, message as msg
+from common import address as addr, message as msg
+from common.config import settings as cfg
 from common.ctx import handle_connection
 from common.exceptions import InvalidMessageStructure
 from common.generators import read_from_client
