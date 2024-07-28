@@ -1,15 +1,14 @@
 DEFAULTS = {
     'BROKER_ADDRESSES': [
-        'localhost:9091',
-        'localhost:9092',
-        'localhost:9093',
-        'localhost:9094',
-        'localhost:9095',
-        'localhost:9096',
+        '192.168.0.101:9091',
+        '192.168.0.101:9092',
+        '192.168.0.101:9093',
+        '192.168.0.101:9094',
+        '192.168.0.101:9095',
+        '192.168.0.101:9096',
     ],
 
-    'LOAD_BALANCER_ADDRESS': 'localhost:9090',
-
+    'LOAD_BALANCER_ADDRESS': '192.168.0.101:9090',
     'MAX_MESSAGE_SIZE': 4096
 
 }

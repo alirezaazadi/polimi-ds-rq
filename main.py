@@ -1,15 +1,11 @@
-from broker import Broker
-import argparse
+from RDQueue.client.dq import RDQueue
 import asyncio
 
-async def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('address', type=str, help='Address to bind the broker to')
-    args = parser.parse_args()
+q = RDQueue(name='test', address=('192.168.0.101', 5000))
+q.push('test1')
+q.push('test2')
+q.push('test3')
 
-    broker = Broker(args.address)
-    await broker.start()
-
-
-if __name__ == '__main__':
-    asyncio.run(main())
+print(q.pop())
+print(q.pop())
+print(q.pop())
