@@ -2,13 +2,14 @@ import argparse
 import asyncio
 import logging
 import uuid
+from pathlib import Path
 
 from RDQueue.common.address import Address, address_factory
 from RDQueue.common.config import settings
-from RDQueue.common.decorator import handle_conn_err
+from RDQueue.common.decorator import handle_conn_err, periodic_task
 from RDQueue.common.message import Message, MessageType, Operation, message_factory as message_factory
 from RDQueue.common.networking import send_message_to_writer, receive_message
-from RDQueue.server.message_queue import manager
+from RDQueue.server.message_queue import QueueManager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__file__)
@@ -17,7 +18,8 @@ logger = logging.getLogger(__file__)
 class Broker:
     def __init__(self, connection_address: Address):
         self._connection_address: Address = connection_address
-        self._q_manager = manager
+        self.snapshot_file = Path(__file__).parent / 'snapshots' / f'{self.connection_address}.pickle'
+        self._q_manager = QueueManager(snapshot_file=self.snapshot_file)
 
         self._id: str = str(uuid.uuid4().hex)
 
@@ -32,6 +34,7 @@ class Broker:
         return self._connection_address
 
     async def start(self):
+
         server = await asyncio.start_server(
             self.handle_client,
             self.connection_address.host_str,
