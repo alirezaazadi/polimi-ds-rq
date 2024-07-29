@@ -110,12 +110,13 @@ class Message:
             'body': self.body,
             'timestamp': self.timestamp,
             '_id': self.id
-        }) + b'EOF'
+        })
 
     @classmethod
     def from_bytes(cls, data: bytes) -> 'Message':
+
         try:
-            message = msgpack.unpackb(data)
+            message = msgpack.unpackb(data[:-2])
 
             message['message_type'] = MessageType(message['message_type'])
             message['operation'] = Operation(message['operation'])
@@ -208,4 +209,4 @@ class MessageFactory:
         return Message.from_bytes(data)
 
 
-factory = MessageFactory()
+message_factory = MessageFactory()

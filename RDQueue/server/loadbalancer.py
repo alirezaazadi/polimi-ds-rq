@@ -1,66 +1,34 @@
 import asyncio
 import heapq
-import json
+import logging
 from typing import Set, List
 
-from RDQueue.common.message import factory as message_factory, MessageType, Message, Operation
-from RDQueue.common.address import Address, address_factory
+from RDQueue.common.address import Address
 from RDQueue.common.config import settings
-from RDQueue.common.ctx import handle_connection
-from RDQueue.common.exceptions import InvalidMessageStructure
-from RDQueue.common.generators import read_from_client
-import logging
+from RDQueue.common.decorator import handle_conn_err, periodic_task
+from RDQueue.common.message import message_factory, MessageType, Message, Operation
+from RDQueue.common.networking import send_message_to_writer, receive_message
 
 logger = logging.getLogger(__file__)
 logging.basicConfig(level=logging.INFO)
 
 
 class Broker:
-    def __init__(self, address: Address, load_balancer_addr: Address):
-        self._address: Address = address
+    def __init__(self, connect_address: Address):
+        self._connect_address: Address = connect_address
         self._load = 0
         self._is_alive = False
         self._id = None
-        self._load_balancer_addr: Address = load_balancer_addr
 
         asyncio.create_task(self._get_broker_info())
-
-    async def _get_broker_info(self):
-        """
-        open a connection with the broker and get its information.
-        :return:
-        """
-        reader, writer = await asyncio.open_connection(self.address.host_str, self.address.port)
-
-        binary_message: bytes = message_factory.broker_info_req(
-            sender_addr=self.load_balancer_addr.connection_str,
-            receiver_addr=self.address.connection_str
-        ).to_bytes()
-        writer.write(binary_message)
-        await writer.drain()
-
-        raw_message: bytes
-        async for raw_message in read_from_client(reader):
-            try:
-
-                msg = message_factory.from_bytes(raw_message)
-                self._id = msg.body
-                self._is_alive = True
-                logger.info(f'Broker {self.address} is alive and ready to serve clients.')
-            except InvalidMessageStructure:
-                pass
 
     @property
     def id(self) -> str | None:
         return self._id
 
     @property
-    def address(self) -> Address:
-        return self._address
-
-    @property
-    def load_balancer_addr(self) -> Address:
-        return self._load_balancer_addr
+    def connect_address(self) -> Address:
+        return self._connect_address
 
     @property
     def load(self) -> int:
@@ -73,6 +41,42 @@ class Broker:
     def is_alive(self) -> bool:
         return self._is_alive
 
+    @periodic_task(interval=5)
+    async def _get_broker_info(self):
+        """
+        open a connection with the broker and get its information.
+        :return:
+        """
+        try:
+            # Enforce a timeout for the connection attempt
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(*self.connect_address.tuple),
+                timeout=1  # Timeout duration in seconds
+            )
+        except asyncio.TimeoutError:
+            self._is_alive = False
+            logger.error(f'Broker {self.connect_address} is not available (connection timed out).')
+            return
+        except Exception as e:
+            self._is_alive = False
+            logger.error(f'Broker {self.connect_address} is not available: {e}.')
+            return
+
+        await send_message_to_writer(writer, message=message_factory.broker_info_req(
+            sender_addr=settings.LOAD_BALANCER_ADDRESS.connection_str,
+            receiver_addr=self.connect_address.connection_str
+        ))
+
+        message = await receive_message(reader)
+
+        if not self._is_alive:
+            self._id = message.body
+            self._is_alive = True
+            logger.info(f'Broker {self.connect_address} is alive and ready to serve clients.')
+
+        writer.close()
+        await writer.wait_closed()
+
     def inc_load(self):
         self._load += 1
 
@@ -80,22 +84,22 @@ class Broker:
         self._load -= 1
 
     def __hash__(self):
-        return hash(self.address)
+        return hash(self.connect_address)
 
     def __lt__(self, other: 'Broker'):
         return self.is_alive < other.is_alive and self.load < other.load
 
     def __str__(self):
-        return f'{self.address}: #({self.load}) clients'
+        return f'{self.connect_address}: #({self.load}) clients'
 
     def __repr__(self):
         return str(self)
 
 
 class LoadBalancer:
-    def __init__(self, address: Address, brokers: Set[Address]):
+    def __init__(self, connection_address: Address, brokers: Set[Address]):
         self._brokers: List = list()
-        self._address: Address = address
+        self._connection_address: Address = connection_address
         self._leader: Address | None = None
 
         self.register_brokers(brokers)
@@ -106,15 +110,15 @@ class LoadBalancer:
         return self._brokers
 
     @property
-    def address(self):
-        return self._address
+    def connection_address(self):
+        return self._connection_address
 
     def register_brokers(self, brokers: Set[Address]):
-        self._brokers = [Broker(broker, load_balancer_addr=self.address) for broker in brokers]
+        self._brokers = [Broker(broker_addr) for broker_addr in brokers]
 
     def add_broker(self, broker_addr: Address):
 
-        broker = Broker(broker_addr, load_balancer_addr=self.address)
+        broker = Broker(broker_addr)
 
         if broker in self.brokers:
             return
@@ -133,54 +137,51 @@ class LoadBalancer:
                 heapq.heapify(self.brokers)
                 break
 
-    def get_next_broker(self) -> Broker:
+    def get_next_broker(self) -> Broker | None:
         min_broker = heapq.heappop(self.brokers)
         min_broker.inc_load()
         heapq.heappush(self.brokers, min_broker)
+
+        if not min_broker.is_alive:
+            logger.error(f'Broker {min_broker.connect_address} is not available. Trying the next broker.')
+            return None
+
         return min_broker
 
     async def start(self):
-        server = await asyncio.start_server(self.handle_client, self.address.host_str, self.address.port)
+        server = await asyncio.start_server(self.handle_client, *self.connection_address.tuple)
         async with server:
             await server.serve_forever()
 
+    @handle_conn_err
     async def handle_client(self, reader, writer):
-        async with handle_connection(writer):
-            raw_message: bytes
-            async for raw_message in read_from_client(reader):
-                try:
-                    await self.handle_message(raw_message, writer)
-                except InvalidMessageStructure:
-                    err = message_factory.error_res(
-                        sender_addr=self.address.connection_str,
-                        receiver_addr=message_factory.from_bytes(raw_message).sender_addr,
-                        body=b'Invalid message structure\n'
-                    ).to_bytes()
+        message = await receive_message(reader)
+        await self.handle_message(message, writer)
 
-                    writer.write(err)
-
-    async def handle_message(self, raw_message: bytes, writer):
-        message = message_factory.from_bytes(raw_message)
+    async def handle_message(self, message, writer):
 
         logger.info(f'Received message: {message}')
 
         if message.message_type == MessageType.REQUEST:
             await self.handle_request(message, writer)
-        elif message.message_type == MessageType.RESPONSE:
-            await self.handle_response(message, writer)
 
     async def handle_request(self, message: Message, writer):
-        if message.operation == Operation.REGISTER_CLIENT:
+        if message.operation == Operation.BROKER_INFO:
             broker = self.get_next_broker()
 
-            binary_message = message_factory.register_client_res(
-                sender_addr=self.address.connection_str,
-                receiver_addr=message.sender_addr,
-                body=json.dumps({'id': broker.id, 'address': broker.address.connection_str})
-            ).to_bytes()
+            if broker is None:
+                logger.error('No broker is available to handle the client registration request.')
+                return
 
-            writer.write(binary_message)
-            await writer.drain()
+            logger.info(f'Broker {broker} is selected to handle the client registration request.')
+
+            await send_message_to_writer(writer, message_factory.register_client_res(
+                sender_addr=self.connection_address.connection_str,
+                receiver_addr=message.sender_addr,
+                body={'id': broker.id, 'address': broker.connect_address.connection_str}
+            ))
+
+            logger.info(f'Broker information sent to client: {broker.connect_address}')
 
     async def handle_response(self, message: Message, writer):
         pass
@@ -188,8 +189,8 @@ class LoadBalancer:
 
 async def main():
     load_balancer = LoadBalancer(
-        address=address_factory.from_str(settings.LOAD_BALANCER_ADDRESS),
-        brokers={address_factory.from_str(broker_addr) for broker_addr in settings.BROKER_ADDRESSES}
+        connection_address=settings.LOAD_BALANCER_ADDRESS,
+        brokers={broker_addr for broker_addr in settings.BROKER_ADDRESSES}
     )
 
     await load_balancer.start()

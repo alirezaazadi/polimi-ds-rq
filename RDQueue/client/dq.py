@@ -1,162 +1,223 @@
 import asyncio
-import json
 import logging
 import uuid
-import socket
+from tenacity import retry, wait_fixed, wait_random, retry_if_exception_type
+
 from RDQueue.common.address import Address, address_factory
 from RDQueue.common.config import settings
-from RDQueue.common.exceptions import InvalidMessageStructure
-from RDQueue.common.generators import read_from_client
-from RDQueue.common.message import factory as message_factory
+from RDQueue.common.decorator import periodic_task
+from RDQueue.common.exceptions import NoBrokerAvailable
+from RDQueue.common.message import message_factory
+from RDQueue.common.networking import send_message_to_writer, receive_message
 
 logger = logging.getLogger(__file__)
 logging.basicConfig(level=logging.INFO)
 
 
-class RDQueue:
-
-    def __init__(self, address: tuple, name: str):
-        self._address: Address = address_factory.from_tuple(*address)
-        self._id = str(uuid.uuid4().hex)
-        self._load_balancer_addr: Address = address_factory.from_str(settings.LOAD_BALANCER_ADDRESS)
+class DQueue:
+    def __init__(self, connection_addr: Address, name: str):
+        self._connection_addr: Address = connection_addr
         self._name: str = name
-        self._broker_id: str | None = None
-        self._broker_addr: Address | None = None
-        self._remote_queue_name: str | None = None
+        self.id = str(uuid.uuid4().hex)
+
         self._remote_queue_id: str | None = None
+        self._remote_queue_name: str | None = None
+        self._broker_addr: Address | None = None
+        self._broker_id: str | None = None
+        self._broker_writer: asyncio.StreamWriter | None = None
+        self._broker_reader: asyncio.StreamReader | None = None
 
-        self.register()
+    async def async_init(self):
+        await self.get_broker_information()
+        await self.init_broker_writer_reader()
+        await self.create_queue()
 
-        self.broker_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.broker_socket.connect((self.broker_addr.host_str, self.broker_addr.port))
+    @retry(wait=wait_fixed(5) + wait_random(0, 2), retry=retry_if_exception_type(NoBrokerAvailable))
+    async def init_broker_writer_reader(self):
 
-        self.create_queue()
+        if self.broker_addr is None:
+            await self.get_broker_information()
+
+        if self._broker_writer is None or self._broker_reader is None:
+            reader, writer = await asyncio.open_connection(
+                self.broker_addr.host_str,
+                self.broker_addr.port
+            )
+
+            self._broker_reader = reader
+            self._broker_writer = writer
+
+    @periodic_task(interval=5)
+    async def check_broker_connection(self):
+        if self.broker_addr is None:
+            await self.get_broker_information()
+
+        else:
+            try:
+                # Enforce a timeout for the connection attempt
+                await asyncio.wait_for(
+                    asyncio.open_connection(*self.broker_addr.tuple),
+                    timeout=1  # Timeout duration in seconds
+                )
+            except asyncio.TimeoutError:
+                self._broker_addr = None
+                logger.error(f'Broker {self.broker_addr} is not available (connection timed out).')
+                return
+            except Exception as e:
+                self._broker_addr = None
+                logger.error(f'Broker {self.broker_addr} is not available: {e}.')
+                return
+
+    async def get_broker_information(self):
+
+        if self.broker_addr is not None:
+            return
+
+        reader, writer = await asyncio.open_connection(
+            settings.LOAD_BALANCER_ADDRESS.host_str,
+            settings.LOAD_BALANCER_ADDRESS.port
+        )
+
+        logger.info(
+            f'{self.name}({self.connection_addr}) is getting broker information from load balancer: {settings.LOAD_BALANCER_ADDRESS}')
+
+        await send_message_to_writer(writer, message_factory.broker_info_req(
+            sender_addr=self.connection_addr.connection_str,
+            receiver_addr=settings.LOAD_BALANCER_ADDRESS.connection_str
+        ))
+
+        logger.info(
+            f'{self.name}({self.connection_addr}) sent broker information request to load balancer: {settings.LOAD_BALANCER_ADDRESS}')
+        response = await receive_message(reader)
+        logger.info(f'{self.name} received broker information from load balancer: {response.body}')
+        self._broker_id = response.body['id']
+        self._broker_addr = address_factory.from_str(response.body['address'])
+
+        logger.info(f'{self.name} is connected to broker: {self.broker_addr}')
+
+    @retry(wait=wait_fixed(5) + wait_random(0, 2), retry=retry_if_exception_type((NoBrokerAvailable, AttributeError)))
+    async def create_queue(self):
+
+        if self.broker_addr is None:
+            await self.get_broker_information()
+
+        reader, writer = await asyncio.open_connection(
+            self.broker_addr.host_str,
+            self.broker_addr.port
+        )
+
+        logger.info(f'Creating queue: {self.name}')
+
+        try:
+            await asyncio.wait_for(
+                send_message_to_writer(
+                    writer=writer,
+                    message=message_factory.queue_create_req(
+                        sender_addr=self.connection_addr.connection_str,
+                        receiver_addr=self.broker_addr.connection_str,
+                        sender_id=self.id,
+                        body=self.name
+                    )
+                ), timeout=3)
+        except asyncio.TimeoutError:
+            logger.error(f'Broker {self.broker_addr} is not available (connection timed out).')
+            raise NoBrokerAvailable()
+
+        logger.info(f'Queue creation request sent to broker: {self.broker_addr}')
+
+        try:
+            message = await asyncio.wait_for(
+                receive_message(reader=reader),
+                timeout=3
+            )
+        except asyncio.TimeoutError:
+            logger.error(f'Broker {self.broker_addr} is not available to receive message (connection timed out).')
+            raise NoBrokerAvailable()
+
+        logger.info(f'Queue created: {message.body}')
+
+        self._remote_queue_id = message.body['id']
+        self._remote_queue_name = message.body['name']
+
+        writer.close()
+        await writer.wait_closed()
 
     @property
-    def address(self) -> Address:
-        return self._address
+    def connection_addr(self):
+        return self._connection_addr
 
     @property
-    def id(self) -> str:
-        return self._id
-
-    @property
-    def name(self) -> str:
+    def name(self):
         return self._name
 
     @property
-    def broker_id(self) -> str | None:
-        return self._broker_id
-
-    @property
-    def broker_addr(self) -> Address | None:
-        return self._broker_addr
-
-    @property
-    def load_balancer_addr(self) -> Address:
-        return self._load_balancer_addr
-
-    @property
-    def remote_queue_name(self) -> str | None:
-        return self._remote_queue_name
-
-    @property
-    def remote_queue_id(self) -> str | None:
+    def remote_queue_id(self):
         return self._remote_queue_id
 
-    def register(self):
-        binary_message = message_factory.register_client_req(
-            sender_addr=self.address.connection_str,
-            receiver_addr=self.load_balancer_addr.connection_str,
-            sender_id=self.id,
-            body=self.address.connection_str.encode()
-        ).to_bytes()
+    @property
+    def broker_addr(self):
+        return self._broker_addr
 
-        load_balancer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        load_balancer_socket.connect((self.load_balancer_addr.host_str, self.load_balancer_addr.port))
-        load_balancer_socket.sendall(binary_message)
+    @retry(wait=wait_fixed(5) + wait_random(0, 2), retry=retry_if_exception_type(NoBrokerAvailable))
+    async def push(self, data):
+        if self.broker_addr is None:
+            raise NoBrokerAvailable()
 
-        data = b''
-        while True:
-            chunk = load_balancer_socket.recv(1024)
-            if b'EOF' in chunk:
-                data += chunk[:chunk.index(b'EOF')]
-                break
-            data += chunk
+        logger.info(f'Pushing data = {data} to queue: {self.name} to broker: {self.broker_addr}')
 
-        msg = message_factory.from_bytes(data)
-        broker_data = json.loads(msg.body)
-        self._broker_id = broker_data['id']
-        self._broker_addr = address_factory.from_str(broker_data['address'])
-        logger.info(f'Registered with broker {self.broker_id} at {self.broker_addr.connection_str}')
+        reader, writer = await asyncio.open_connection(
+            self.broker_addr.host_str,
+            self.broker_addr.port
+        )
 
-        load_balancer_socket.close()
+        await send_message_to_writer(
+            writer=writer,
+            message=message_factory.queue_push_req(
+                sender_addr=self.connection_addr.connection_str,
+                receiver_addr=self.broker_addr.connection_str,
+                sender_id=self.id,
+                body={
+                    'queue_name': self.name,
+                    'message': data
+                }
+            )
+        )
 
-    def create_queue(self):
-        binary_message = message_factory.queue_create_req(
-            sender_addr=self.address.connection_str,
-            receiver_addr=self.broker_addr.connection_str,
-            sender_id=self.id,
-            body=self.name
-        ).to_bytes()
+        message = await receive_message(reader)
 
-        self.broker_socket.sendall(binary_message)
+        logger.info(
+            f'Data = {data} pushed to queue: {self.name} to broker: {self.broker_addr} with status: {message.body}')
 
-        data = b''
-        while True:
-            chunk = self.broker_socket.recv(1024)
-            if b'EOF' in chunk:
-                data += chunk[:chunk.index(b'EOF')]
-                break
-            data += chunk
+        writer.close()
+        await writer.wait_closed()
 
-        msg = message_factory.from_bytes(data)
-        queue_data = json.loads(msg.body)
-        self._remote_queue_name = queue_data['name']
-        self._remote_queue_id = queue_data['id']
-        logger.info(f'Queue created: {self.remote_queue_name} with id {self.remote_queue_id}')
+    @retry(wait=wait_fixed(5) + wait_random(0, 2), retry=retry_if_exception_type(NoBrokerAvailable))
+    async def pop(self):
+        if self.broker_addr is None:
+            raise NoBrokerAvailable()
 
-    def push(self, message):
-        binary_message = message_factory.queue_push_req(
-            sender_addr=self.address.connection_str,
-            receiver_addr=self.broker_addr.connection_str,
-            sender_id=self.id,
-            receiver_id=self.broker_id,
-            body=json.dumps({'queue_name': self.remote_queue_name, 'message': message})
-        ).to_bytes()
+        logger.info(f'Popping data from queue: {self.name} from broker: {self.broker_addr}')
 
-        self.broker_socket.sendall(binary_message)
+        reader, writer = await asyncio.open_connection(
+            self.broker_addr.host_str,
+            self.broker_addr.port
+        )
 
-        data = b''
-        while True:
-            chunk = self.broker_socket.recv(10)
-            if b'EOF' in chunk:
-                data += chunk[:chunk.index(b'EOF')]
-                break
-            data += chunk
+        await send_message_to_writer(
+            writer=writer,
+            message=message_factory.queue_pop_req(
+                sender_addr=self.connection_addr.connection_str,
+                receiver_addr=self.broker_addr.connection_str,
+                sender_id=self.id,
+                body=self.name
+            )
+        )
 
-        msg = message_factory.from_bytes(data)
-        logger.info(f'Message pushed: {msg}')
+        message = await receive_message(reader)
 
-    def pop(self):
-        binary_message = message_factory.queue_pop_req(
-            sender_addr=self.address.connection_str,
-            receiver_addr=self.broker_addr.connection_str,
-            sender_id=self.id,
-            receiver_id=self.broker_id
-        ).to_bytes()
+        logger.info(f'Data = {message.body} popped from queue: {self.name} from broker: {self.broker_addr}')
 
-        self.broker_socket.sendall(binary_message)
+        writer.close()
+        await writer.wait_closed()
 
-        data = b''
-        while True:
-            chunk = self.broker_socket.recv(10)
-            if b'EOF' in chunk:
-                data += chunk[:chunk.index(b'EOF')]
-                break
-            data += chunk
-
-        msg = message_factory.from_bytes(data)
-        logger.info(f'Message popped: {msg}')
-
-        return msg.body
+        return message.body

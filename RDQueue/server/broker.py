@@ -1,85 +1,65 @@
 import argparse
 import asyncio
-import json
 import logging
 import uuid
 
-import Pyro4
-
 from RDQueue.common.address import Address, address_factory
 from RDQueue.common.config import settings
-from RDQueue.common.ctx import handle_connection
-from RDQueue.common.exceptions import InvalidMessageStructure
-from RDQueue.common.generators import read_from_client
-from RDQueue.common.message import Message, MessageType, Operation, factory as message_factory
-from RDQueue.server.q import manager
+from RDQueue.common.decorator import handle_conn_err
+from RDQueue.common.message import Message, MessageType, Operation, message_factory as message_factory
+from RDQueue.common.networking import send_message_to_writer, receive_message
+from RDQueue.server.message_queue import manager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__file__)
 
 
-@Pyro4.expose
 class Broker:
-    def __init__(self, address: Address):
-        self._address: Address = address
+    def __init__(self, connection_address: Address):
+        self._connection_address: Address = connection_address
         self._q_manager = manager
 
         self._id: str = str(uuid.uuid4().hex)
 
-        logger.info(f'Broker ({self.id}) started at {self.address.connection_str}')
+        logger.info(f'Broker ({self.id}) started at {self.connection_address.connection_str}')
 
     @property
     def id(self) -> str:
         return self._id
 
     @property
-    def address(self) -> Address:
-        return self._address
+    def connection_address(self) -> Address:
+        return self._connection_address
 
     async def start(self):
-        server = await asyncio.start_server(self.handle_client, self.address.host_str, self.address.port)
+        server = await asyncio.start_server(
+            self.handle_client,
+            self.connection_address.host_str,
+            self.connection_address.port
+        )
         async with server:
             await server.serve_forever()
 
+    @handle_conn_err
     async def handle_client(self, reader, writer):
-        async with handle_connection(writer):
-            raw_message: bytes
-            async for raw_message in read_from_client(reader):
-                try:
-                    await self.handle_message(raw_message, writer)
-                except InvalidMessageStructure:
-                    err = message_factory.error_res(
-                        sender_addr=self.address.connection_str,
-                        receiver_addr=Message.from_bytes(raw_message).sender_addr,
-                        body=b'Invalid message structure\n'
-                    ).to_bytes()
-                    writer.write(err)
+        message = await receive_message(reader)
+        await self.handle_message(message, writer)
 
-    async def handle_message(self, raw_message: bytes, writer):
-        message = message_factory.from_bytes(raw_message)
+    async def handle_message(self, message, writer):
 
-        logger.info(f'Received message: {message}')
-
-        if message.receiver_id and message.receiver_id != self.id:
-            binary_message = message_factory.error_res(sender_addr=self.address.connection_str,
-                                                       receiver_addr=message.sender_addr).to_bytes()
-            writer.write(binary_message)
-            await writer.drain()
-            return
+        if not message.operation == Operation.BROKER_INFO:
+            logger.info(f'Received message: {message}')
 
         if message.message_type == MessageType.REQUEST:
             await self.handle_request(message, writer)
-        elif message.message_type == MessageType.RESPONSE:
-            await self.handle_response(message, writer)
 
     async def handle_request(self, message: Message, writer):
         if message.operation == Operation.BROKER_INFO:
-            binary_message = message_factory.broker_info_res(sender_addr=self.address.connection_str,
-                                                             receiver_addr=message.sender_addr,
-                                                             body=self.id).to_bytes()
-
-            writer.write(binary_message)
-            await writer.drain()
+            await send_message_to_writer(writer, message=message_factory.broker_info_res(
+                sender_addr=self.connection_address.connection_str,
+                receiver_addr=message.sender_addr,
+                body=self.id
+            ))
 
         elif message.operation == Operation.QUEUE_CREATE:
             q = self._q_manager.create_queue(
@@ -92,36 +72,35 @@ class Broker:
                 'id': q.id,
             }
 
-            binary_message = message_factory.queue_create_res(sender_addr=self.address.connection_str,
-                                                              receiver_addr=message.sender_addr,
-                                                              body=json.dumps(q_info)).to_bytes()
-
-            writer.write(binary_message)
-            await writer.drain()
+            await send_message_to_writer(writer, message=message_factory.queue_create_res(
+                sender_addr=self.connection_address.connection_str,
+                receiver_addr=message.sender_addr,
+                body=q_info
+            ))
 
         elif message.operation == Operation.QUEUE_PUSH:
 
-            body = json.loads(message.body)
+            body = message.body
 
-            self._q_manager.push(queue_name=body['queue_name'], message=body['message'])
-            binary_message = message_factory.queue_push_res(sender_addr=self.address.connection_str,
-                                                            receiver_addr=message.sender_addr).to_bytes()
+            self._q_manager.push(message=message)
 
-            writer.write(binary_message)
-            await writer.drain()
+            await send_message_to_writer(writer, message=message_factory.queue_push_res(
+                sender_addr=self.connection_address.connection_str,
+                receiver_addr=message.sender_addr,
+                body='OK'
+            ))
+
+            logger.info(f'Pushed message to queue: {body["queue_name"]}')
 
         elif message.operation == Operation.QUEUE_POP:
-            msg = self._q_manager.pop(message.body, client_id=message.sender_id)
+            msg = self._q_manager.pop(message)
 
-            binary_message = message_factory.queue_pop_res(sender_addr=self.address.connection_str,
-                                                           receiver_addr=message.sender_addr,
-                                                           body=msg).to_bytes()
-
-            writer.write(binary_message)
-            await writer.drain()
-
-    async def handle_response(self, message: Message, writer):
-        pass
+            await send_message_to_writer(writer, message=message_factory.queue_pop_res(
+                sender_addr=self.connection_address.connection_str,
+                receiver_addr=message.sender_addr,
+                receiver_id=message.sender_id,
+                body=msg
+            ))
 
 
 async def main():
@@ -133,7 +112,7 @@ async def main():
     args = arg_parser.parse_args()
 
     if args.all:
-        brokers = [Broker(address_factory.from_str(addr)) for addr in settings.BROKER_ADDRESSES]
+        brokers = [Broker(addr) for addr in settings.BROKER_ADDRESSES]
 
     else:
         brokers = [Broker(address_factory.from_tuple(args.host, args.port))]

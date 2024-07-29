@@ -19,6 +19,20 @@ class Address:
     def connection_str(self):
         return f'{self.host_str}:{self.port}'
 
+    @staticmethod
+    def is_valid_address(addr: str) -> bool:
+        try:
+            host, port = addr.split(':')
+
+            if host == 'localhost':
+                host = '127.0.0.1'
+
+            ipaddress.ip_address(host)
+            int(port)
+            return True
+        except:  # noqa
+            return False
+
     def __str__(self):
         return f'{self.host}:{self.port}'
 

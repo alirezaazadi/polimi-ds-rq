@@ -1,7 +1,7 @@
 import uuid
 from collections import defaultdict
 from typing import Dict, List
-from RDQueue.common.message import Message, factory as message_factory
+from RDQueue.common.message import Message, message_factory as message_factory
 
 
 class Queue:
@@ -9,7 +9,7 @@ class Queue:
         self._owner: str = owner
         self._id: str = str(uuid.uuid4().hex)
         self._clients_positions: Dict[str, int] = defaultdict(lambda: -1)
-        self._name: str = f'{name}_{self._id}'
+        self._name: str = name
         self._messages: List[Message] = []
 
     @property
@@ -25,7 +25,10 @@ class Queue:
         return self._id
 
     def push(self, message: Message):
-        self._messages.append(message)
+        self._messages.append(message.body['message'])
+
+        if message.sender_id not in self._clients_positions:
+            self._clients_positions[message.sender_id] = 0
 
     def pop(self, client_id: str) -> Message:
         """
@@ -55,11 +58,14 @@ class QueueManager:
 
         return queue
 
-    def push(self, queue_name: str, message: Message):
+    def push(self, message: Message):
+        queue_name = message.body['queue_name']
         queue = self._queues[queue_name]
         queue.push(message)
 
-    def pop(self, queue_name: str, client_id: str) -> Message:
+    def pop(self, message: Message) -> Message:
+        queue_name = message.body
+        client_id = message.sender_id
         queue = self._queues[queue_name]
         return queue.pop(client_id)
 
