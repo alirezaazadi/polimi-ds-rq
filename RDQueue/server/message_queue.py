@@ -4,6 +4,9 @@ import uuid
 from collections import defaultdict
 from typing import Dict, List
 import json
+
+from pysyncobj import SyncObj, replicated_sync
+
 from RDQueue.common.message import Message
 import logging
 
@@ -55,20 +58,18 @@ class Queue:
         return message
 
     def __str__(self):
-        return json.dumps({
-            'name': self._name,
-            'owner': self._owner,
-            'id': self._id,
-            'clients_positions': self._clients_positions,
-            'messages': self._messages
-        })
+        return str(self._messages)
 
     def __repr__(self):
         return self.__str__()
 
+    def __hash__(self):
+        return hash(self.name)
 
-class QueueManager:
-    def __init__(self, snapshot_file):
+
+class QueueManager(SyncObj):
+    def __init__(self, snapshot_file, self_address, other_addresses):
+        super(QueueManager, self).__init__(self_address, other_addresses)
         self._queues: Dict[str, Queue] = {}
         self._snapshot_file = snapshot_file
         os.makedirs(snapshot_file.parent, exist_ok=True)
@@ -96,7 +97,7 @@ class QueueManager:
 
         return wrapper
 
-    @_snapshot_decorator
+    @replicated_sync
     def create_queue(self, name: str, owner: str):
 
         if name in self._queues:
@@ -107,15 +108,22 @@ class QueueManager:
 
         return queue
 
-    @_snapshot_decorator
+    @replicated_sync
     def push(self, message: Message):
         queue_name = message.body['queue_name']
         queue = self._queues[queue_name]
         queue.push(message)
 
-    @_snapshot_decorator
+    @replicated_sync
     def pop(self, message: Message) -> str:
         queue_name = message.body
         client_id = message.sender_id
         queue = self._queues[queue_name]
         return queue.pop(client_id)
+
+    def print_queues_messages(self, address: str = None):
+        for queue in self._queues.values():
+            print(f"Queue {queue.name} -> {address}: {queue}")
+
+    def snap(self):
+        self.create_snapshot()

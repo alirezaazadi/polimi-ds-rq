@@ -19,11 +19,17 @@ class Broker:
     def __init__(self, connection_address: Address):
         self._connection_address: Address = connection_address
         self.snapshot_file = Path(__file__).parent / 'snapshots' / f'{self.connection_address}.pickle'
-        self._q_manager = QueueManager(snapshot_file=self.snapshot_file)
+        self._q_manager = QueueManager(snapshot_file=self.snapshot_file,
+                                       self_address='192.168.0.101:8081' if self.connection_address.connection_str.endswith(
+                                           '1') else '192.168.0.101:8082',
+                                       other_addresses=[
+                                           '192.168.0.101:8081' if self.connection_address.connection_str.endswith(
+                                               '2') else '192.168.0.101:8082'])
 
         self._id: str = str(uuid.uuid4().hex)
 
         logger.info(f'Broker ({self.id}) started at {self.connection_address.connection_str}')
+        asyncio.create_task(self.periodic_snapshot())
 
     @property
     def id(self) -> str:
@@ -104,6 +110,11 @@ class Broker:
                 receiver_id=message.sender_id,
                 body=msg
             ))
+
+    @periodic_task(interval=10)
+    async def periodic_snapshot(self):
+        self._q_manager.create_snapshot()
+        self._q_manager.print_queues_messages(address=self.connection_address.connection_str)
 
 
 async def main():

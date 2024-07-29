@@ -10,12 +10,7 @@ async def main():
     )
 
     await queue.async_init()
-    await queue.push('Hello, World!')
-    await queue.push('Hello, World1!')
-    await queue.push('Hello, World2!')
-    await queue.push('Hello, World3!')
-    await queue.push('Hello, World4!')
-    print(await queue.pop())
+    await queue.push('Azadi')
 
 
 if __name__ == '__main__':
